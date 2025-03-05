@@ -4,6 +4,7 @@ import sys
 import csv
 import tempfile
 import os
+import concurrent.futures
 from multiprocessing import Process, Queue
 from detect_secrets import SecretsCollection
 from detect_secrets.settings import default_settings
@@ -86,7 +87,8 @@ def scan_repo_for_secrets(repo_url):
             clone_repo(repo_url, tmpdirname)
         except Exception:
             return {"error": f"Failed to clone {repo_url}"}
-        findings = scan_directory(tmpdirname)
+        # findings = scan_directory(tmpdirname)
+        findings = scan_directory_concurrent(tmpdirname)
         return findings
 
 def clone_repo(repo_url, clone_to_dir):
@@ -130,6 +132,15 @@ def scan_file_worker(file_path, queue):
     # Put the result (a JSON string or a dict) into the queue.
     queue.put(secrets.json())
 
+def scan_file_worker_concurrent(file_path):
+    """
+    Worker function that scans a file for secrets and returns a tuple of (file_path, result).
+    """
+    secrets = SecretsCollection()
+    with default_settings():
+        secrets.scan_file(file_path)
+    return file_path, secrets.json()
+
 def scan_file_with_timeout(file_path, timeout=100):
     """
     Scans a single file using a separate process.
@@ -165,6 +176,46 @@ def scan_directory(directory, timeout=100):
             print(f"Finished Scanning File: {file_path}")
             if result:  # only record if result is not empty
                 findings[file_path] = result
+    return findings
+
+
+def scan_directory_concurrent(directory, timeout=100, max_workers=None):
+    """
+    Collects all file paths in the directory and scans them concurrently using a process pool.
+    If scanning a file takes longer than `timeout` seconds, it is skipped.
+
+    Parameters:
+        directory (str): The directory to scan.
+        timeout (int): Per-file timeout in seconds.
+        max_workers (int): Maximum number of worker processes (default: os.cpu_count()).
+
+    Returns:
+        findings (dict): A dictionary mapping file paths to scan results.
+    """
+    # Collect all file paths to scan.
+    file_paths = []
+    for root, _, files in os.walk(directory):
+        for filename in files:
+            file_path = os.path.join(root, filename)
+            file_paths.append(file_path)
+
+    findings = {}
+    # Use a process pool to scan files concurrently.
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all files to the executor.
+        future_to_file = {executor.submit(scan_file_worker_concurrent, fp): fp for fp in file_paths}
+
+        # Process results as they complete.
+        for future in concurrent.futures.as_completed(future_to_file):
+            file_path = future_to_file[future]
+            try:
+                fp, result = future.result(timeout=timeout)
+                if result:
+                    findings[fp] = result
+            except concurrent.futures.TimeoutError:
+                print(f"Timeout scanning {file_path}")
+            except Exception as e:
+                print(f"Error scanning {file_path}: {e}")
     return findings
 
 def write_scan_results_to_csv(results: list, output_csv: str):
